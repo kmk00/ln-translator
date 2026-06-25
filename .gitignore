@@ -1,0 +1,9 @@
+.env
+output/
+.venv
+__pycache__/
+ln_translator.egg-info
+*.txt
+prompt.yaml
+
+!requirements.txt

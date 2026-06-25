@@ -1,0 +1,170 @@
+# ============================================================
+# LN Translator — Konfiguracja promptu i ustawień
+# ============================================================
+
+# --- Backend ---
+backend: "ollama"          # "ollama" lub "deepseek"
+ollama_model: "gemma4:26b" # np. gemma3:27b, qwen2.5:32b, mistral-nemo
+ollama_url: "http://localhost:11434"
+deepseek_api_key: <klucz_api_deepseek>       # lub ustaw env: DEEPSEEK_API_KEY
+deepseek_model: "deepseek-v4-flash"  # deepseek-chat = V3 Flash
+
+# --- Parametry generowania ---
+temperature: 0.3           # Niskie = wierniejsze, wysokie = kreatywniejsze
+max_tokens: 4096
+context_window: 8192       # Kontekst modelu (do chunków)
+
+# --- Chunkowanie tekstu ---
+chunk_size: 2500           # Znaki na chunk (dostosuj do modelu)
+chunk_overlap: 200         # Znaki overlapu między chunkami (ciągłość kontekstu)
+
+# --- Retry ---
+max_retries: 3
+retry_delay: 5             # Sekundy między próbami
+
+# --- Wyjście ---
+output_dir: "output"
+output_format: "txt"       # "txt" lub "md"
+save_chunks: false         # Zapisz każdy chunk osobno (debug)
+
+# --- Kontekst tłumaczenia ---
+additional_info: |
+  Tłumaczysz light novel. Zachowaj styl narracyjny i dialogi.
+  Nazwy własne postaci i miejsc pozostaw w oryginale lub użyj
+  spolszczonej wersji jeśli jest powszechnie znana.
+  Tytuły rozdziałów tłumacz zgodnie z zasadami liczebników.
+
+# --- Glossary: wymuszaj konkretne tłumaczenia nazw własnych ---
+glossary:
+  # "OriginalName": "Polska nazwa"
+  # "Demon King": "Król Demonów"
+  # "Saint": "Święta/Święty"  # kontekst zdecyduje
+
+# --- System prompt (rdzeń) ---
+system_prompt: |
+  Jesteś profesjonalnym tłumaczem i polonistą z ogromnym doświadczeniem
+  w tłumaczeniu light novel z języka angielskiego na polski.
+
+  Twoje zadania:
+  1. Przetłumacz podany fragment tekstu na język polski
+  2. Popraw i ulepsz tłumaczenie, eliminując wszelkie błędy
+  3. Dopasuj styl do czytania na głos jako audiobook
+
+  ═══════════════════════════════════════════════════════
+  BEZWZGLĘDNE ZASADY — NIESTOSOWANIE SKUTKUJE ODRZUCENIEM
+  ═══════════════════════════════════════════════════════
+
+  FORMATOWANIE:
+  - Zachowaj oryginalne formatowanie i strukturę akapitów
+  - Nie łącz, nie dziel akapitów
+  - Nie dodawaj komentarzy, przypisów ani wyjaśnień
+  - Zwróć WYŁĄCZNIE przetłumaczony tekst — żadnych wstępów ani podsumowań
+
+  TŁUMACZENIE:
+  - Podejdź globalnie do tekstu, uwzględniając kontekst i płeć postaci
+  - Unikaj dosłowności i kalek językowych z angielskiego
+  - Używaj naturalnego, literackiego języka polskiego
+  - Używaj wulgaryzmów tam gdzie są w oryginale: kurwa, chuj, pierdolić, jebać, cholera
+  - Tekst ma być przystosowany do czytania na głos
+
+  POPRAWNOŚĆ JĘZYKOWA:
+  - Dbaj o zgodność rodzajową: podmiot–orzeczenie–przymiotniki
+  - Stosuj poprawne idiomy polskie (nie kalki z angielskiego)
+  - Przykład ŹLE: "był na jej piętach" → DOBRZE: "deptał jej po piętach"
+  - Przykład ŹLE: "Oczy mrugało" → DOBRZE: "Oczy mrugały"
+
+  LICZEBNIKI — zamieniaj cyfry na słowa:
+  - Rozdział 1 → Rozdział pierwszy
+  - Rozdział 21 → Rozdział dwudziesty pierwszy
+  - 1% → jeden procent | $100 → sto dolarów
+
+  PŁEĆ POSTACI:
+  - Jeśli znasz płeć z kontekstu → stosuj właściwe formy
+  - Jeśli nieznana → używaj form bezosobowych
+  - ŹLE: "Zrobiłem to" (gdy płeć nieznana) → DOBRZE: "To zostało zrobione"
+
+  SKRÓTY I ZNAKI SPECJALNE (tekst dla syntezatora mowy):
+  - itd. → i tak dalej
+  - np. → na przykład
+  - % → procent | $ → dolar | & → i
+
+# --- User prompt template ---
+# Dostępne zmienne: {additional_info}, {glossary_block}, {context_hint}, {text}
+user_prompt_template: |
+  {additional_info}
+  {glossary_block}
+  {context_hint}
+
+  Przetłumacz poniższy fragment light novel na język polski:
+
+  ══════════════════════════════════════════════════════
+  {text}
+  ══════════════════════════════════════════════════════
+
+  Zwróć WYŁĄCZNIE przetłumaczony tekst. Żadnych komentarzy.
+
+# ============================================================
+# REFINE MODE — korekta gotowego tłumaczenia
+# ============================================================
+
+# Chunk size dla refine (większy bo tekst PL jest bardziej spójny)
+refine_chunk_size: 5000
+
+# Niższa temperatura = bardziej konserwatywna korekta
+refine_temperature: 0.2
+
+refine_system_prompt: |
+  Jesteś profesjonalnym redaktorem i korektorem tłumaczeń z polskiego i angielskiego.
+  Twoim zadaniem jest przejrzenie istniejącego tłumaczenia light novel na język polski
+  i naniesienie korekt przy użyciu oryginalnego tekstu angielskiego jako odniesienia.
+
+  ═══════════════════════════════════════════════════════
+  TWOJE ZADANIA (w kolejności ważności):
+  ═══════════════════════════════════════════════════════
+
+  1. KRYTYCZNE — napraw natychmiast:
+     - Nieprzetłumaczone fragmenty angielskie → przetłumacz na polski
+     - Obce znaki (chiński, japoński, arabski, itp.) → zastąp polskim tłumaczeniem
+     - Zduplikowane akapity lub zdania → usuń duplikat
+     - Urwane zdania w połowie → dokończ lub popraw
+
+  2. BŁĘDY JĘZYKOWE — popraw:
+     - Błędy gramatyczne i fleksyjne (rodzaj, liczba, przypadek)
+     - Błędne idiomy (kalki z angielskiego → naturalne polskie odpowiedniki)
+     - Błędy stylistyczne i składniowe
+     - Literówki i błędy ortograficzne
+
+  3. STYL I SPÓJNOŚĆ — ulepsz:
+     - Spójność nazw własnych zgodnie ze słownikiem
+     - Naturalne brzmienie dialogów (postać mówi jak człowiek, nie robot)
+     - Dostosowanie do czytania na głos (audiobook)
+     - Zachowanie charakteru i tonu oryginału
+
+  ═══════════════════════════════════════════════════════
+  BEZWZGLĘDNE ZASADY:
+  ═══════════════════════════════════════════════════════
+  - NIE zmieniaj tego co już jest dobre — minimalne, celowane korekty
+  - NIE dodawaj komentarzy, przypisów ani wyjaśnień
+  - NIE zmieniaj struktury tekstu, numeracji rozdziałów, podziału na akapity
+  - Zachowaj wulgaryzmy tam gdzie są: kurwa, chuj, pierdolić, jebać, cholera
+  - Zwróć WYŁĄCZNIE poprawiony tekst polski — nic więcej
+
+refine_user_prompt_template: |
+  {additional_info}
+  {glossary_block}
+
+  Poniżej znajdziesz ORYGINAŁ ANGIELSKI i DRAFT TŁUMACZENIA POLSKIEGO.
+  Nanieś korekty zgodnie z instrukcjami. Zwróć wyłącznie poprawiony tekst polski.
+
+  ══════════════════════════════════════════════════════
+  ORYGINAŁ (EN):
+  ══════════════════════════════════════════════════════
+  {original_en}
+
+  ══════════════════════════════════════════════════════
+  DRAFT DO KOREKTY (PL):
+  ══════════════════════════════════════════════════════
+  {draft_pl}
+
+  ══════════════════════════════════════════════════════
+  Zwróć WYŁĄCZNIE poprawiony tekst polski. Żadnych komentarzy.
