@@ -64,6 +64,16 @@ uv run translator retry output/<plik_wyjściowy>
 # Zregeneruj tylko wybrane chunki (6, 8) ręcznie
 uv run translator retry output/<plik_wyjściowy> --chunks 6 8
 
+# ────────────────────────────────────────────────────────
+# GO Scripts
+# ────────────────────────────────────────────────────────
+
+#Convert PDF to TXT (zachowuje formatowanie)
+cd scripts/converter
+go run main.go sample.pdf output.txt
+
+go run main.go --split sample.pdf output.txt  # split by chapters
+
 ```
 
 ## Konfiguracja (prompt.yaml)
