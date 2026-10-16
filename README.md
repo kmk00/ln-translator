@@ -76,6 +76,31 @@ go run main.go --split sample.pdf output.txt  # split by chapters
 
 ```
 
+## Format 1:1 (linijka po linijce)
+
+Źródła `*-plain.txt` są **zdanie-w-linii**, więc silnik wymusza **jedną linię
+wyjścia na jedną linię wejścia**:
+
+1. wejście chunku jest numerowane (`1. …`, `2. …`), a model dostaje twarde
+   polecenie oddania dokładnie tej samej liczby linii (`line_rule` w prompcie);
+2. jeśli liczba linii się rozjedzie, prompt jest powtarzany z informacją zwrotną
+   („miałeś N linii, wymagane M”) — `line_retries` w `prompt.yaml`;
+3. jeśli to nie pomoże, blok jest dzielony **rekurencyjnie** (aż do pojedynczych
+   linii) i składany z powrotem — gwarantuje to zgodność 1:1.
+
+Dzięki temu `uv run translator retry <plik>` sam domyka wadliwe chunki,
+a zewnętrzna bramka `tools/fix_errors.py verify <plik>` przechodzi jako `OK`.
+
+**Stitch wyrównany do źródła.** Chunki są cięte na granicach zdań, więc jedna
+linia źródła może zostać przecięta na pół. `stitch_chunks()` składa PL linia po
+linii względem źródła EN: łączy połówki rozciętych linii spacją i nie dodaje
+pustych linii. Liczba niepustych linii wyjścia = liczba niepustych linii wejścia.
+
+> **Naprawiony bug:** `postprocess()` używał wzorca `[^:]*` bez wykluczenia `\n`,
+> przez co potrafił zjeść kilka linii aż do najbliższego dwukropka i sam tworzył
+> rozjazdy linii. Wzorce są teraz ograniczone do jednej linii, a nagłówek
+> `[Fragment N z M]` nie jest wstawiany do tekstu do tłumaczenia.
+
 ## Konfiguracja (prompt.yaml)
 
 Edytuj `prompt.yaml` przed pierwszym uruchomieniem:
