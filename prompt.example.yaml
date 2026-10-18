@@ -1,31 +1,47 @@
 # ============================================================
-# LN Translator — Konfiguracja promptu i ustawień
+# LN Translator — PRZYKŁADOWA konfiguracja (szablon)
+# ============================================================
+# Skopiuj i uzupełnij:
+#     cp prompt.example.yaml prompt.yaml
+#
+# `prompt.yaml` jest w .gitignore — NIE commituj go (może zawierać klucze API).
+# Ten plik (`prompt.example.yaml`) jest bezpiecznym szablonem: bez kluczy,
+# z wartościami domyślnymi i komentarzami.
+#
+# Klucze API trzymaj w `.env` (patrz `.env.example`) albo w zmiennych
+# środowiskowych — kod czyta je i nadpisują wartości z tego pliku:
+#     DEEPSEEK_API_KEY, OPENCODE_API_KEY,
+#     OLLAMA_URL, OLLAMA_MODEL, LN_BACKEND, LN_REASONING_EFFORT
 # ============================================================
 
 # --- Backend ---
-backend: "ollama"          # "ollama" lub "deepseek"
-ollama_model: "gemma4:26b" # np. gemma3:27b, qwen2.5:32b, mistral-nemo
+backend: "ollama"          # "ollama" | "deepseek" | "opencode-go"
+ollama_model: "huihui_ai/gemma-4-abliterated:26b" # np. gemma3:27b, qwen2.5:32b, mistral-nemo
 ollama_url: "http://localhost:11434"
-deepseek_api_key: <klucz_api_deepseek>       # lub ustaw env: DEEPSEEK_API_KEY
-deepseek_model: "deepseek-v4-flash"  # deepseek-chat = V3 Flash
+deepseek_api_key: ""       # lub ustaw env: DEEPSEEK_API_KEY
+deepseek_model: "deepseek-chat"  # deepseek-chat = V3 Flash
+
+# --- OpenCode Go (subskrypcja) ---
+opencode_go_api_key: ""    # lub ustaw env: OPENCODE_API_KEY
+opencode_go_model: "glm-5.3-flash"
+reasoning_effort: "low"    # deep thinking GLM: low / medium / high / max ("" = domyślny serwera = max)
 
 # --- Parametry generowania ---
 temperature: 0.3           # Niskie = wierniejsze, wysokie = kreatywniejsze
-max_tokens: 4096
-context_window: 8192       # Kontekst modelu (do chunków)
+max_tokens: 16384
 
 # --- Chunkowanie tekstu ---
 chunk_size: 2500           # Znaki na chunk (dostosuj do modelu)
-chunk_overlap: 200         # Znaki overlapu między chunkami (ciągłość kontekstu)
+chunk_overlap: 200         # nieużywane — kontekst ciągłości: prev_translation (ostatnie linie)
 
 # --- Retry ---
 max_retries: 3
 retry_delay: 5             # Sekundy między próbami
+line_retries: 2            # Ile razy dopytać, gdy liczba linii PL ≠ EN (1:1)
 
 # --- Wyjście ---
 output_dir: "output"
 output_format: "txt"       # "txt" lub "md"
-save_chunks: false         # Zapisz każdy chunk osobno (debug)
 
 # --- Kontekst tłumaczenia ---
 additional_info: |
@@ -36,7 +52,11 @@ additional_info: |
 
 # --- Glossary: wymuszaj konkretne tłumaczenia nazw własnych ---
 glossary:
-  # "OriginalName": "Polska nazwa"
+  # "Purge king": "Król Oczyszczenia"
+  # "Frederica": "Frederika"
+  # "Beatrice": "Beatris"
+  # "Elsa": "Elza"
+  # "Lord Od Lagna": "Lord Od Lagna"
   # "Demon King": "Król Demonów"
   # "Saint": "Święta/Święty"  # kontekst zdecyduje
 
@@ -54,9 +74,10 @@ system_prompt: |
   BEZWZGLĘDNE ZASADY — NIESTOSOWANIE SKUTKUJE ODRZUCENIEM
   ═══════════════════════════════════════════════════════
 
-  FORMATOWANIE:
-  - Zachowaj oryginalne formatowanie i strukturę akapitów
-  - Nie łącz, nie dziel akapitów
+  FORMATOWANIE (KRYTYCZNE — ZŁAMANIE = ODRZUCENIE):
+  - Tłumacz DOKŁADNIE linijka po linijce: JEDNA linia wejścia = JEDNA linia wyjścia
+  - Zachowaj numerację, kolejność i liczbę linii; nie łącz, nie dziel, nie dodawaj linii
+  - Nie dodawaj pustych linii między liniami ani numerów spoza podanego zakresu
   - Nie dodawaj komentarzy, przypisów ani wyjaśnień
   - Zwróć WYŁĄCZNIE przetłumaczony tekst — żadnych wstępów ani podsumowań
 
@@ -89,11 +110,15 @@ system_prompt: |
   - % → procent | $ → dolar | & → i
 
 # --- User prompt template ---
-# Dostępne zmienne: {additional_info}, {glossary_block}, {context_hint}, {text}
+# Dostępne zmienne: {additional_info}, {glossary_block}, {context_hint},
+#                   {line_rule}, {text}
+# {line_rule} wstawia silnik automatycznie (twarda reguła 1:1 linia-po-linii).
 user_prompt_template: |
   {additional_info}
   {glossary_block}
   {context_hint}
+
+  {line_rule}
 
   Przetłumacz poniższy fragment light novel na język polski:
 

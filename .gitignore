@@ -1,9 +1,35 @@
+# ── Sekrety ──────────────────────────────────────────────────────────────
 .env
-output/
-.venv
-__pycache__/
-ln_translator.egg-info
-*.txt
+.env.*
+!.env.example
 prompt.yaml
+*.local.yaml
 
+# ── Wyjścia tłumaczenia (odtwarzalne, duże) ──────────────────────────────
+output/
+*_chunks/
+*.cache.json
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# ── Teksty robocze (nie commituj treści książek) ─────────────────────────
+*.txt
 !requirements.txt
+
+# ── Edytory / system ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
