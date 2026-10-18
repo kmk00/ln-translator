@@ -12,6 +12,7 @@ import os
 import time
 import re
 import json
+import hashlib
 import argparse
 import textwrap
 import unicodedata
@@ -19,6 +20,11 @@ from pathlib import Path
 from datetime import datetime
 
 CHUNK_ERROR_MARKER = "[BŁĄD TŁUMACZENIA — CHUNK"
+
+
+class GenerationStopped(Exception):
+    """Rzucony, gdy użytkownik zażądał zatrzymania generowania
+    (przycisk Stop / limit czasu). Nie jest ponawiany przez retry-wrapper."""
 
 import yaml
 import requests
@@ -290,12 +296,15 @@ class OllamaBackend:
             },
         }
         response_text = []
+        stop_event = getattr(self, "stop_event", None)
         with requests.post(f"{self.url}/api/chat", json=payload, stream=True, timeout=300) as resp:
             if resp.status_code == 400 and b"does not support thinking" in (resp.content or b""):
                 payload.pop("think")
             else:
                 resp.raise_for_status()
             for line in resp.iter_lines():
+                if stop_event is not None and stop_event.is_set():
+                    raise GenerationStopped("zatrzymano w trakcie generowania")
                 if not line:
                     continue
                 try:
@@ -354,12 +363,15 @@ class DeepSeekBackend:
             "max_tokens": self.max_tokens,
         }
         response_text = []
+        stop_event = getattr(self, "stop_event", None)
         with requests.post(
             f"{self.BASE_URL}/chat/completions",
             headers=headers, json=payload, stream=True, timeout=300
         ) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
+                if stop_event is not None and stop_event.is_set():
+                    raise GenerationStopped("zatrzymano w trakcie generowania")
                 if not line:
                     continue
                 line_str = line.decode("utf-8") if isinstance(line, bytes) else line
@@ -445,12 +457,15 @@ class OpenCodeGoBackend:
         response_text = []
         reasoning_tokens = 0
         finish_reason = None
+        stop_event = getattr(self, "stop_event", None)
         with requests.post(
             f"{self.BASE_URL}/chat/completions",
             headers=headers, json=payload, stream=True, timeout=300
         ) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
+                if stop_event is not None and stop_event.is_set():
+                    raise GenerationStopped("zatrzymano w trakcie generowania")
                 if not line:
                     continue
                 line_str = line.decode("utf-8") if isinstance(line, bytes) else line
@@ -508,17 +523,20 @@ def progress_bar(current: int, total: int, width: int = 40) -> str:
 class StreamPrinter:
     PREVIEW_LIMIT = 400  # znaki streamowane na żywo; dalej licznik
 
-    def __init__(self, max_width: int = 96):
+    def __init__(self, max_width: int = 96, silent: bool = False):
         self.buffer = ""
         self.line_len = 0
         self.max_width = max_width
         self.token_count = 0
         self.shown = 0
         self.collapsed = False
+        self.silent = silent  # GUI: tylko licznik tokenów, bez wydruku na konsolę
 
     def on_token(self, token: str):
         self.token_count += 1
         self.buffer += token
+        if self.silent:
+            return
         for ch in token:
             if self.shown >= self.PREVIEW_LIMIT and not self.collapsed:
                 print(f"{C.DIM} … (reszta streamu skrócona)", end="", flush=True)
@@ -798,6 +816,8 @@ def generate_with_retry(backend, system_prompt, user_prompt, cfg, on_token=None,
     for attempt in range(1, max_retries + 1):
         try:
             return backend.generate(system_prompt, user_prompt, on_token, temperature)
+        except GenerationStopped:
+            raise  # Stop użytkownika — bez ponawiania i bez opóźnień
         except requests.exceptions.Timeout:
             print(c(C.YELLOW, f"\n  ⚠ Timeout (próba {attempt}/{max_retries})"))
         except requests.exceptions.HTTPError as e:
@@ -867,9 +887,9 @@ def write_error_log(output_path: str, failures: dict, input_path: str = "", tota
 
 # ── Session & Retry Functions ─────────────────────────────────────────────────
 def find_chunks_dir(output_path: str) -> Path | None:
-    """Znajduje katalog chunków dla pliku wyjściowego (nowy i stary layout)."""
+    """Znajduje katalog chunków (run dir / plik wyjściowy / stary layout)."""
     out = Path(output_path)
-    for d in (out.parent / "chunks", out.parent / f"{out.stem}_chunks"):
+    for d in (out / "chunks", out.parent / "chunks", out.parent / f"{out.stem}_chunks"):
         if (d / "session.json").exists():
             return d
     return None
@@ -905,8 +925,84 @@ def detect_error_chunks(output_path: str) -> list[int]:
                 pass
     return sorted(failed)
 
-def retry_chunks(output_path: str, chunk_numbers: list[int], cfg: dict, verbose: bool = True) -> None:
-    """Regeneruje wskazane chunki i scala je z powrotem do pliku wyjściowego."""
+def stitch_session(output_path: str, retried: list[int] | None = None,
+                   new_failures: dict | None = None, verbose: bool = True) -> str | None:
+    """Skleja chunki z sesji do pliku wyjściowego i aktualizuje session.json.
+
+    Wspólny finalizator dla `retry` (po regeneracji) i GUI (ręczne scalanie
+    po ręcznych edycjach chunków). Zwraca ścieżkę wyjściową lub None, gdy
+    w sesji nie ma żadnych chunków.
+    """
+    retried = retried or []
+    new_failures = new_failures or {}
+    out = Path(output_path)
+    if not out.exists() and not find_chunks_dir(output_path):
+        return None
+    meta = load_session(output_path)
+    chunks_dir = Path(meta["chunks_dir"])
+    orig_dir = chunks_dir / "original"
+    overlap = meta["overlap"]
+    total_chunks = meta["total_chunks"]
+
+    all_chunks = []
+    all_en = []
+    for i in range(1, total_chunks + 1):
+        cf = chunks_dir / f"chunk_{i:03d}.txt"
+        if cf.exists():
+            all_chunks.append(cf.read_text(encoding="utf-8"))
+            ef = orig_dir / f"chunk_{i:03d}.txt"
+            all_en.append(ef.read_text(encoding="utf-8") if ef.exists() else "")
+
+    if not all_chunks:
+        return None
+
+    final_text = stitch_chunks(all_chunks, overlap, all_en)
+    out.write_text(final_text, encoding="utf-8")
+
+    # Usuń z listy "failed_chunks" tylko te chunki, które się faktycznie naprawiły
+    meta["failed_chunks"] = [n for n in meta.get("failed_chunks", []) if n not in retried]
+
+    # Scal stare i nowe błędy → errors.md
+    merged_failures = {
+        str(k): v for k, v in meta.get("failures", {}).items() if int(k) not in retried
+    }
+    for num, entry in new_failures.items():
+        merged_failures[str(num)] = entry
+    meta["failures"] = merged_failures
+    (chunks_dir / "session.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    log_path = write_error_log(output_path, merged_failures, meta.get("input_path", ""), total_chunks)
+
+    if verbose:
+        print(f"{C.GREEN}{C.BOLD}╔══════════════════════════════════════════════════╗")
+        print(f"║  ✓ Regeneracja zakończona!                       ║")
+        print(f"╚══════════════════════════════════════════════════╝{C.RESET}")
+        print(f"\n  {c(C.CYAN, '💾 Zaktualizowano:')} {c(C.WHITE, output_path)}")
+        if new_failures:
+            print(f"\n  {c(C.RED, '⚠ Nadal wadliwe chunki:')}")
+            for num, entry in new_failures.items():
+                reason = entry["reason"] if isinstance(entry, dict) else entry
+                print(f"    {c(C.RED, f'• Chunk {num}')} {c(C.DIM, '—')} {reason}")
+        if log_path:
+            print(f"\n  {c(C.CYAN, '📝 Raport błędów:')} {c(C.WHITE, log_path)}")
+        print(f"\n  Ponów próbę: {c(C.WHITE, f'uv run translator.py retry {output_path}')}")
+    return output_path
+
+
+def retry_chunks(output_path: str, chunk_numbers: list[int], cfg: dict, verbose: bool = True,
+                 on_event=None, finalize: bool = True) -> None:
+    """Regeneruje wskazane chunki i scala je z powrotem do pliku wyjściowego.
+
+    finalize=False (GUI) — pomija sklejanie; plik wyjściowy powstaje przy
+    ręcznym scalaniu (stitch_session).
+    """
+    def emit(ev: dict):
+        if on_event:
+            try:
+                on_event(ev)
+            except Exception:
+                pass
+
     out = Path(output_path)
     if not out.exists():
         print(c(C.RED, f"✗ Plik wyjściowy nie istnieje: {output_path}"))
@@ -929,14 +1025,18 @@ def retry_chunks(output_path: str, chunk_numbers: list[int], cfg: dict, verbose:
     if verbose:
         print(f"  {c(C.CYAN, '🔄 Regeneracja chunków:')} {c(C.WHITE, str(chunk_numbers))}")
 
-    print(f"  {c(C.DIM, 'Sprawdzam połączenie...')}", end=" ", flush=True)
-    if backend.check_connection():
-        print(c(C.GREEN, "✓ OK"))
-    else:
-        print(c(C.RED, "✗ BŁĄD"))
-        sys.exit(1)
+        if verbose:
+            print(f"  {c(C.DIM, 'Sprawdzam połączenie...')}", end=" ", flush=True)
+        if backend.check_connection():
+            if verbose:
+                print(c(C.GREEN, "✓ OK"))
+        else:
+            if verbose:
+                print(c(C.RED, "✗ BŁĄD"))
+            sys.exit(1)
 
-    print()
+    if verbose:
+        print()
     start_time = time.time()
     total_tokens = 0
     successfully_retried = []
@@ -945,7 +1045,11 @@ def retry_chunks(output_path: str, chunk_numbers: list[int], cfg: dict, verbose:
     for chunk_num in chunk_numbers:
         orig_file = orig_dir / f"chunk_{chunk_num:03d}.txt"
         if not orig_file.exists():
-            print(c(C.RED, f"  ✗ Brak oryginału EN dla chunk {chunk_num}: {orig_file}"))
+            if verbose:
+                print(c(C.RED, f"  ✗ Brak oryginału EN dla chunk {chunk_num}: {orig_file}"))
+            emit({"type": "chunk_done", "idx": chunk_num, "total": total_chunks,
+                  "en": "", "pl": "", "ok": False, "reason": "brak oryginału EN",
+                  "took": 0.0, "tokens": 0, "lines_en": 0, "lines_pl": 0})
             continue
 
         chunk_started = time.time()
@@ -958,12 +1062,15 @@ def retry_chunks(output_path: str, chunk_numbers: list[int], cfg: dict, verbose:
                 prev_lines = prev_text.strip().split("\n")
                 prev_translation = "\n".join(prev_lines[-6:])
 
-        header = f"Regeneracja chunk {chunk_num}/{total_chunks}"
-        print(f"{C.BOLD}{C.YELLOW}┌─ {header} {'─' * max(0, 54-len(header)-2)}┐{C.RESET}")
-        print(f"{C.YELLOW}│{C.RESET}  {c(C.DIM, f'Rozmiar: {len(orig_chunk):,} znaków')}")
-        print(f"{C.YELLOW}└{'─' * 54}┘{C.RESET}\n")
+        if verbose:
+            header = f"Regeneracja chunk {chunk_num}/{total_chunks}"
+            print(f"{C.BOLD}{C.YELLOW}┌─ {header} {'─' * max(0, 54-len(header)-2)}┐{C.RESET}")
+            print(f"{C.YELLOW}│{C.RESET}  {c(C.DIM, f'Rozmiar: {len(orig_chunk):,} znaków')}")
+            print(f"{C.YELLOW}└{'─' * 54}┘{C.RESET}\n")
 
-        printer = StreamPrinter()
+        emit({"type": "chunk_start", "idx": chunk_num, "total": total_chunks})
+
+        printer = StreamPrinter(silent=not verbose)
         result, _fmt_attempts = generate_translation(
             backend, system_prompt, cfg, orig_chunk, chunk_num - 1, total_chunks,
             prev_translation, printer.on_token)
@@ -972,11 +1079,16 @@ def retry_chunks(output_path: str, chunk_numbers: list[int], cfg: dict, verbose:
         took = time.time() - chunk_started
 
         if not result:
-            print(c(C.RED, f"  ✗ Chunk {chunk_num}: pusta odpowiedź (think/budżet modelu?) — zachowuję stary"))
+            if verbose:
+                print(c(C.RED, f"  ✗ Chunk {chunk_num}: pusta odpowiedź (think/budżet modelu?) — zachowuję stary"))
             failure_reasons[chunk_num] = {
                 "reason": "pusta odpowiedź",
                 "details": [],
             }
+            emit({"type": "chunk_done", "idx": chunk_num, "total": total_chunks,
+                  "en": orig_chunk, "pl": "", "ok": False, "reason": "pusta odpowiedź",
+                  "took": took, "tokens": printer.token_count,
+                  "lines_en": count_lines(orig_chunk), "lines_pl": 0})
             continue
 
         result = postprocess(result)
@@ -987,21 +1099,32 @@ def retry_chunks(output_path: str, chunk_numbers: list[int], cfg: dict, verbose:
 
         if orig_lines != trans_lines:
             reason = f"niezgodność linii: EN {orig_lines} ≠ PL {trans_lines}"
-            print(c(C.RED, f"  ✗ Chunk {chunk_num}: {reason} (po {took:.1f}s)"))
             details = line_mismatch_report(orig_chunk, result)
-            for l in details:
-                print(l)
+            if verbose:
+                print(c(C.RED, f"  ✗ Chunk {chunk_num}: {reason} (po {took:.1f}s)"))
+                for l in details:
+                    print(l)
+            clean = result
             result = f"{CHUNK_ERROR_MARKER} {chunk_num}]\n\n{result}"
             chunk_file = chunks_dir / f"chunk_{chunk_num:03d}.txt"
             chunk_file.write_text(result, encoding="utf-8")
             failure_reasons[chunk_num] = {"reason": reason, "details": details}
+            emit({"type": "chunk_done", "idx": chunk_num, "total": total_chunks,
+                  "en": orig_chunk, "pl": clean, "ok": False, "reason": reason,
+                  "took": took, "tokens": printer.token_count,
+                  "lines_en": count_lines(orig_chunk), "lines_pl": count_lines(clean)})
             continue
 
         chunk_file = chunks_dir / f"chunk_{chunk_num:03d}.txt"
         chunk_file.write_text(result, encoding="utf-8")
-        print(f"  {c(C.GREEN, f'✓ Chunk {chunk_num} zaktualizowany')} "
-              f"{c(C.DIM, f'— {len(result):,} znaków, {took:.1f}s, ~{printer.token_count} tok.')}\n")
+        if verbose:
+            print(f"  {c(C.GREEN, f'✓ Chunk {chunk_num} zaktualizowany')} "
+                  f"{c(C.DIM, f'— {len(result):,} znaków, {took:.1f}s, ~{printer.token_count} tok.')}\n")
         successfully_retried.append(chunk_num)
+        emit({"type": "chunk_done", "idx": chunk_num, "total": total_chunks,
+              "en": orig_chunk, "pl": result, "ok": True, "reason": "",
+              "took": took, "tokens": printer.token_count,
+              "lines_en": count_lines(orig_chunk), "lines_pl": count_lines(result)})
 
     all_chunks = []
     all_en = []
@@ -1012,14 +1135,10 @@ def retry_chunks(output_path: str, chunk_numbers: list[int], cfg: dict, verbose:
             ef = orig_dir / f"chunk_{i:03d}.txt"
             all_en.append(ef.read_text(encoding="utf-8") if ef.exists() else "")
 
-    if all_chunks:
-        final_text = stitch_chunks(all_chunks, overlap, all_en)
-        out.write_text(final_text, encoding="utf-8")
-
-        # Usuń z listy "failed_chunks" tylko te chunki, które się faktycznie naprawiły
+    if not finalize:
+        # GUI: regeneracja bez sklejania — plik wyjściowy powstaje przy ręcznym
+        # scaleniu (stitch_session). Metadane sesji i tak muszą być aktualne.
         meta["failed_chunks"] = [n for n in meta.get("failed_chunks", []) if n not in successfully_retried]
-
-        # Scal stare i nowe błędy → errors.md
         merged_failures = {
             str(k): v for k, v in meta.get("failures", {}).items() if int(k) not in successfully_retried
         }
@@ -1027,24 +1146,159 @@ def retry_chunks(output_path: str, chunk_numbers: list[int], cfg: dict, verbose:
             merged_failures[str(num)] = entry
         meta["failures"] = merged_failures
         (chunks_dir / "session.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        return
 
-        log_path = write_error_log(output_path, merged_failures, meta.get("input_path", ""), total_chunks)
-
-        print(f"{C.GREEN}{C.BOLD}╔══════════════════════════════════════════════════╗")
-        print(f"║  ✓ Regeneracja zakończona!                       ║")
-        print(f"╚══════════════════════════════════════════════════╝{C.RESET}")
-        print(f"\n  {c(C.CYAN, '💾 Zaktualizowano:')} {c(C.WHITE, output_path)}")
-        if failure_reasons:
-            print(f"\n  {c(C.RED, '⚠ Nadal wadliwe chunki:')}")
-            for num, entry in failure_reasons.items():
-                reason = entry["reason"] if isinstance(entry, dict) else entry
-                print(f"    {c(C.RED, f'• Chunk {num}')} {c(C.DIM, '—')} {reason}")
-        if log_path:
-            print(f"\n  {c(C.CYAN, '📝 Raport błędów:')} {c(C.WHITE, log_path)}")
-        print(f"\n  Ponów próbę: {c(C.WHITE, f'uv run translator.py retry {output_path}')}")
+    if all_chunks:
+        stitch_session(output_path, retried=successfully_retried,
+                       new_failures=failure_reasons, verbose=verbose)
 
 # ── Core translation pipeline ─────────────────────────────────────────────────
-def translate_file(input_path: str, cfg: dict, output_path: str = None, dry_run: bool = False, verbose: bool = True) -> str:
+def _translate_one_chunk(backend, system_prompt, cfg, chunk, idx, total_chunks,
+                         prev_translation, chunks_dir: Path, orig_dir: Path,
+                         verbose: bool, emit, eta: float = 0.0) -> dict:
+    """Generuje jeden chunk (z korektą 1:1 linii), waliduje i zapisuje EN + PL.
+
+    Wspólny krok pętli dla `translate_file` i `resume_translation`.
+    Zwraca dict: pl (pełny wynik, z markerem błędu gdy niezgodny),
+    clean (bez markera), ok, reason, details, took, tokens.
+    """
+    if verbose:
+        header = f"Chunk {idx}/{total_chunks}"
+        print(f"{C.BOLD}{C.CYAN}┌─ {header} {'─' * max(0, 54-len(header)-2)}┐{C.RESET}")
+        print(f"{C.CYAN}│{C.RESET}  {progress_bar(idx-1, total_chunks, 38)}  "
+              f"{c(C.DIM, f'ETA: {int(eta)}s') if eta > 0 else ''}")
+        print(f"{C.CYAN}└{'─' * 54}┘{C.RESET}\n")
+
+    chunk_started = time.time()
+
+    # Zapisanie oryginału (wymagane do ponawiania)
+    (orig_dir / f"chunk_{idx:03d}.txt").write_text(chunk, encoding="utf-8")
+
+    printer = StreamPrinter(silent=not verbose)
+    result, _fmt_attempts = generate_translation(
+        backend, system_prompt, cfg, chunk, idx - 1, total_chunks,
+        prev_translation, printer.on_token)
+    printer.finish(f"chunk_{idx:03d}.txt")
+    took = time.time() - chunk_started
+
+    clean_result = result
+    chunk_failed = False
+    failure_reason = ""
+    failure_details = []
+    if not result:
+        failure_reason = "pusta odpowiedź (model zmieścił wszystko w thinking / HTTP?)"
+        if verbose:
+            print(c(C.RED, f"  ✗ Chunk {idx}: {failure_reason} (po {took:.1f}s)"))
+        chunk_failed = True
+    else:
+        result = postprocess(result)
+        clean_result = result
+
+        # Sprawdzanie ilości linii (ignorując całkowicie puste akapity)
+        orig_lines = len([l for l in chunk.split('\n') if l.strip()])
+        trans_lines = len([l for l in result.split('\n') if l.strip()])
+
+        if orig_lines != trans_lines:
+            failure_reason = f"niezgodność linii: EN {orig_lines} ≠ PL {trans_lines}"
+            if verbose:
+                print(c(C.RED, f"  ✗ Chunk {idx}: {failure_reason} (po {took:.1f}s)"))
+                failure_details = line_mismatch_report(chunk, result)
+                for l in failure_details:
+                    print(l)
+            chunk_failed = True
+
+    if chunk_failed:
+        result = f"{CHUNK_ERROR_MARKER} {idx}]\n\n{clean_result}"
+
+    # Zapisanie wyniku PL
+    (chunks_dir / f"chunk_{idx:03d}.txt").write_text(result, encoding="utf-8")
+
+    if not chunk_failed and verbose:
+        print(f"  {c(C.GREEN, f'✓ Chunk {idx}/{total_chunks}')}"
+              f"{c(C.DIM, f' — {len(result):,} znaków, {took:.1f}s, ~{printer.token_count} tok.')}")
+    if verbose:
+        print()
+
+    emit({
+        "type": "chunk_done",
+        "idx": idx,
+        "total": total_chunks,
+        "en": chunk,
+        "pl": clean_result or "",
+        "ok": not chunk_failed,
+        "reason": failure_reason,
+        "took": took,
+        "tokens": printer.token_count,
+        "lines_en": count_lines(chunk),
+        "lines_pl": count_lines(clean_result or ""),
+    })
+
+    return {"pl": result, "clean": clean_result or "", "ok": not chunk_failed,
+            "reason": failure_reason, "details": failure_details,
+            "took": took, "tokens": printer.token_count}
+
+
+# ── Stop / sesja: lock i deadline ─────────────────────────────────────────────
+def _acquire_session_lock(chunks_dir: Path) -> Path | None:
+    """Pilnuje, by tę samą sesję nie tłumaczyły dwa procesy naraz.
+
+    Zapisuje PID do chunks/lock; odrzuca start, gdy istniejący lock należy
+    do żywego procesu. Zwraca ścieżkę locka (usuwanie: _release_session_lock)
+    lub None, gdy zapis się nie powiódł.
+    """
+    lock = chunks_dir / "lock"
+    try:
+        if lock.exists():
+            try:
+                pid = int(lock.read_text(encoding="utf-8").strip())
+                os.kill(pid, 0)
+                print(c(C.RED, f"✗ Ta sesja może działać w innym procesie (pid {pid}). "
+                               f"Jeśli na pewno nie — usuń ręcznie: {lock}"))
+                sys.exit(1)
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass  # plik-śmieć / martwy pid → nadpisujemy
+        lock.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError as e:
+        print(c(C.YELLOW, f"  ⚠ Nie udało się zapisać locka sesji ({e}) — kontynuuję."))
+        return None
+    return lock
+
+
+def _release_session_lock(lock: Path | None) -> None:
+    if not lock:
+        return
+    try:
+        if lock.exists():
+            lock.unlink()
+    except OSError:
+        pass
+
+
+def _stopped_session_message(why: str) -> str:
+    if why == "time":
+        return "⏱ Limit czasu osiągnięty — sesja zapisana."
+    if why == "keyboard":
+        return "⏸ Przerwano (Ctrl+C) — sesja zapisana."
+    return "⏸ Zatrzymano — sesja zapisana."
+
+
+def translate_file(input_path: str, cfg: dict, output_path: str = None, dry_run: bool = False,
+                   verbose: bool = True, interactive: bool = True, on_event=None,
+                   finalize: bool = True, stop_event=None, max_time: float = None) -> str:
+    """Tłumaczy plik chunk po chunku, zapisując każdy wynik od razu na dysku.
+
+    stop_event — obiekt z .is_set() (np. threading.Event); sprawdź przed każdym
+    chunkiem i w trakcie generowania (natychmiastowy abort bieżącego chunka).
+    max_time  — limit czasu w sekundach (deadline względem startu).
+    Przerwanie = stan "stopped" w session.json; wznowienie: resume_translation().
+    """
+    def emit(ev: dict):
+        if on_event:
+            try:
+                on_event(ev)
+            except Exception:
+                pass
+
     path = Path(input_path)
     if not path.exists():
         print(c(C.RED, f"✗ Plik nie istnieje: {input_path}"))
@@ -1059,13 +1313,21 @@ def translate_file(input_path: str, cfg: dict, output_path: str = None, dry_run:
 
     backend = get_backend(cfg)
     backend_name = cfg.get("backend", "ollama")
+    model_name = {
+        "ollama":       cfg.get("ollama_model"),
+        "deepseek":     cfg.get("deepseek_model"),
+        "opencode-go":  cfg.get("opencode_go_model"),
+    }.get(backend_name)
 
     if not dry_run:
-        print(f"\n  {c(C.DIM, 'Sprawdzam połączenie...')}", end=" ", flush=True)
+        if verbose:
+            print(f"\n  {c(C.DIM, 'Sprawdzam połączenie...')}", end=" ", flush=True)
         if backend.check_connection():
-            print(c(C.GREEN, "✓ OK"))
+            if verbose:
+                print(c(C.GREEN, "✓ OK"))
         else:
-            print(c(C.RED, "✗ BŁĄD"))
+            if verbose:
+                print(c(C.RED, "✗ BŁĄD"))
             sys.exit(1)
 
     chunk_size = cfg.get("chunk_size", 2500)
@@ -1090,85 +1352,7 @@ def translate_file(input_path: str, cfg: dict, output_path: str = None, dry_run:
     orig_chunks_dir = chunks_dir / "original"
     orig_chunks_dir.mkdir(parents=True, exist_ok=True)
 
-    system_prompt = cfg["system_prompt"].strip()
-    translated_chunks = []
-    prev_translation = ""
-    total_tokens = 0
-    failed_chunks = []
-    failure_log = {}
-    start_time = time.time()
-
-    print()
-
-    for i, chunk in enumerate(chunks):
-        elapsed = time.time() - start_time
-        eta = (elapsed / (i + 0.001)) * (total_chunks - i) if i > 0 else 0
-
-        header = f"Chunk {i+1}/{total_chunks}"
-        print(f"{C.BOLD}{C.CYAN}┌─ {header} {'─' * max(0, 54-len(header)-2)}┐{C.RESET}")
-        print(f"{C.CYAN}│{C.RESET}  {progress_bar(i, total_chunks, 38)}  "
-              f"{c(C.DIM, f'ETA: {int(eta)}s') if eta > 0 else ''}")
-        print(f"{C.CYAN}└{'─' * 54}┘{C.RESET}\n")
-
-        chunk_started = time.time()
-        # Zapisanie oryginału (wymagane do ponawiania)
-        (orig_chunks_dir / f"chunk_{i+1:03d}.txt").write_text(chunk, encoding="utf-8")
-
-        printer = StreamPrinter()
-        result, _fmt_attempts = generate_translation(
-            backend, system_prompt, cfg, chunk, i, total_chunks, prev_translation,
-            printer.on_token)
-        printer.finish(f"chunk_{i+1:03d}.txt")
-        total_tokens += printer.token_count
-        took = time.time() - chunk_started
-
-        chunk_failed = False
-        failure_reason = ""
-        failure_details = []
-        if not result:
-            failure_reason = "pusta odpowiedź (model zmieścił wszystko w thinking / HTTP?)"
-            print(c(C.RED, f"  ✗ Chunk {i+1}: {failure_reason} (po {took:.1f}s)"))
-            result = f"{CHUNK_ERROR_MARKER} {i+1}]\n\n{chunk}"
-            failed_chunks.append(i+1)
-            chunk_failed = True
-        else:
-            result = postprocess(result)
-
-            # Sprawdzanie ilości linii (ignorując całkowicie puste akapity)
-            orig_lines = len([l for l in chunk.split('\n') if l.strip()])
-            trans_lines = len([l for l in result.split('\n') if l.strip()])
-
-            if orig_lines != trans_lines:
-                failure_reason = f"niezgodność linii: EN {orig_lines} ≠ PL {trans_lines}"
-                print(c(C.RED, f"  ✗ Chunk {i+1}: {failure_reason} (po {took:.1f}s)"))
-                failure_details = line_mismatch_report(chunk, result)
-                for l in failure_details:
-                    print(l)
-                # Doklejamy marker z błędem, ale zostawiamy też wygenerowany tekst
-                result = f"{CHUNK_ERROR_MARKER} {i+1}]\n\n{result}"
-                failed_chunks.append(i+1)
-                chunk_failed = True
-
-        translated_chunks.append(result)
-        prev_translation = result
-
-        # Zapisanie wyniku PL
-        (chunks_dir / f"chunk_{i+1:03d}.txt").write_text(result, encoding="utf-8")
-
-        if chunk_failed:
-            failure_log[i+1] = {"reason": failure_reason, "details": failure_details}
-        else:
-            print(f"  {c(C.GREEN, f'✓ Chunk {i+1}/{total_chunks}')}"
-                  f"{c(C.DIM, f' — {len(result):,} znaków, {took:.1f}s, ~{printer.token_count} tok.')}")
-        print()
-
-    final_text = stitch_chunks(translated_chunks, overlap, chunks)
-    output_chars = len(final_text)
-    total_elapsed = time.time() - start_time
-
-    Path(output_path).write_text(final_text, encoding="utf-8")
-
-    # Zapis sesji (wymagany do ponawiania)
+    # Wczesny zapis sesji — resume działa też po przerwaniu tłumaczenia
     meta = {
         "input_path": str(path.resolve()),
         "output_path": str(Path(output_path).resolve()),
@@ -1176,38 +1360,428 @@ def translate_file(input_path: str, cfg: dict, output_path: str = None, dry_run:
         "chunk_size": chunk_size,
         "overlap": overlap,
         "total_chunks": total_chunks,
-        "failed_chunks": failed_chunks,
-        "failures": {str(k): v for k, v in failure_log.items()},
+        "input_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "state": "running",
+        "next_chunk": 1,
+        "backend": backend_name,
+        "model": model_name,
+        "failed_chunks": [],
+        "failures": {},
     }
     (chunks_dir / "session.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    print(f"{C.GREEN}{C.BOLD}╔══════════════════════════════════════════════════╗")
-    print(f"║  ✓ Tłumaczenie zakończone!                       ║")
-    print(f"╚══════════════════════════════════════════════════╝{C.RESET}")
-    print(f"\n  {c(C.CYAN, '💾 Zapisano:')} {c(C.WHITE, output_path)}")
-    print(f"  {c(C.CYAN, '📁 Folder:')}    {c(C.WHITE, str(run_dir.resolve()))}")
+    emit({
+        "type": "start",
+        "input_path": str(path.resolve()),
+        "output_path": str(Path(output_path).resolve()),
+        "backend": backend_name,
+        "model": model_name,
+        "total_chunks": total_chunks,
+        "chunks_en": chunks,
+        "chunk_size": chunk_size,
+    })
+
+    system_prompt = cfg["system_prompt"].strip()
+    translated_chunks = []
+    prev_translation = ""
+    total_tokens = 0
+    failed_chunks = []
+    failure_log = {}
+    start_time = time.time()
+    deadline = start_time + max_time if max_time else None
+    stop_reason = None   # None | "user" | "time" | "keyboard"
+    lock = _acquire_session_lock(chunks_dir)
+
+    if verbose:
+        print()
+
+    try:
+        for i, chunk in enumerate(chunks):
+            # ── punkty zatrzymania: stop / limit czasu ──────────────────────
+            if stop_event is not None and stop_event.is_set():
+                stop_reason = "user"
+                break
+            if deadline is not None and time.time() >= deadline:
+                stop_reason = "time"
+                break
+
+            emit({"type": "chunk_start", "idx": i + 1, "total": total_chunks})
+
+            elapsed = time.time() - start_time
+            eta = (elapsed / (i + 0.001)) * (total_chunks - i) if i > 0 else 0
+
+            r = _translate_one_chunk(
+                backend, system_prompt, cfg, chunk, i + 1, total_chunks,
+                prev_translation, chunks_dir, orig_chunks_dir, verbose, emit, eta=eta)
+
+            result = r["pl"]
+            translated_chunks.append(result)
+            prev_translation = result
+            total_tokens += r["tokens"]
+            if not r["ok"]:
+                failed_chunks.append(i + 1)
+                failure_log[i + 1] = {"reason": r["reason"], "details": r["details"]}
+
+            # Sesja po każdym chunku — na wypadek stopu / restartu komputera
+            meta.update({
+                "state": "running",
+                "next_chunk": i + 2,
+                "failed_chunks": failed_chunks,
+                "failures": {str(k): v for k, v in failure_log.items()},
+            })
+            (chunks_dir / "session.json").write_text(
+                json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    except GenerationStopped:
+        # Stop przyjdzie w trakcie generowania: bieżący chunk nie ma zapisu,
+        # więc resume wygeneruje go od zera.
+        stop_reason = "user"
+        emit({"type": "chunk_aborted", "idx": len(translated_chunks) + 1})
+    except KeyboardInterrupt:
+        stop_reason = "keyboard"
+        emit({"type": "chunk_aborted", "idx": len(translated_chunks) + 1})
+
+    total_elapsed = time.time() - start_time
+
+    if stop_reason:
+        # Nie sklejamy niedokończonego pliku — brakuje gotowych chunków
+        # (a bieżący chunk został przerwany i nie ma zapisu).
+        meta.update({
+            "state": "stopped",
+            "next_chunk": len(translated_chunks) + 1,
+            "failed_chunks": failed_chunks,
+            "failures": {str(k): v for k, v in failure_log.items()},
+        })
+        (chunks_dir / "session.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        _release_session_lock(lock)
+        if verbose:
+            print(c(C.YELLOW, f"  {_stopped_session_message(stop_reason)}"))
+            print(c(C.DIM, f"  Wznowienie: uv run translator resume {output_path}"))
+            if failed_chunks:
+                print(c(C.DIM, f"  Chunki z błędami: {failed_chunks} — naprawa: uv run translator retry {output_path}"))
+        emit({
+            "type": "stopped",
+            "next_chunk": len(translated_chunks) + 1,
+            "stop_reason": stop_reason,
+            "elapsed": total_elapsed,
+            "failed_chunks": list(failed_chunks),
+        })
+        return output_path
+
+    # finalize=False (GUI): chunki zapisane, sklejenie następuje ręcznie
+    # (stitch_session) po ewentualnych poprawkach użytkownika.
+    output_chars = 0
+    if finalize:
+        final_text = stitch_chunks(translated_chunks, overlap, chunks)
+        output_chars = len(final_text)
+        Path(output_path).write_text(final_text, encoding="utf-8")
+
+    if verbose and finalize:
+        print(f"{C.GREEN}{C.BOLD}╔══════════════════════════════════════════════════╗")
+        print(f"║  ✓ Tłumaczenie zakończone!                       ║")
+        print(f"╚══════════════════════════════════════════════════╝{C.RESET}")
+        print(f"\n  {c(C.CYAN, '💾 Zapisano:')} {c(C.WHITE, output_path)}")
+        print(f"  {c(C.CYAN, '📁 Folder:')}    {c(C.WHITE, str(run_dir.resolve()))}")
 
     # Opcja autozregenerowania
     if failed_chunks:
         log_path = write_error_log(output_path, failure_log, str(path.resolve()), total_chunks)
-        if log_path:
-            print(f"  {c(C.CYAN, '📝 Raport błędów:')} {c(C.WHITE, log_path)}")
-        print(f"\n  {c(C.RED, '⚠ Chunks z błędami (klucz → powód):')}")
-        for n in failed_chunks:
-            reason = failure_log[n]["reason"]
-            print(f"    {c(C.RED, f'• Chunk {n}/{total_chunks}')} {c(C.DIM, '—')} {reason}")
-        try:
-            answer = input(f"\n  {c(C.YELLOW, '→ Spróbować zregenerować te chunki teraz? [t/N]: ')}").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            answer = "n"
+        if verbose:
+            if log_path:
+                print(f"  {c(C.CYAN, '📝 Raport błędów:')} {c(C.WHITE, log_path)}")
+            print(f"\n  {c(C.RED, '⚠ Chunks z błędami (klucz → powód):')}")
+            for n in failed_chunks:
+                reason = failure_log[n]["reason"]
+                print(f"    {c(C.RED, f'• Chunk {n}/{total_chunks}')} {c(C.DIM, '—')} {reason}")
+        answer = "n"
+        if interactive:
+            try:
+                answer = input(f"\n  {c(C.YELLOW, '→ Spróbować zregenerować te chunki teraz? [t/N]: ')}").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = "n"
         if answer in ("t", "tak", "y", "yes"):
             retry_chunks(output_path, failed_chunks, cfg, verbose)
-        else:
+        elif verbose:
             print(c(C.DIM, f"\n  Możesz to zrobić później używając komendy:"))
             print(c(C.DIM, f"  uv run translator retry {output_path}"))
 
-    print_stats(input_chars, output_chars, total_elapsed, total_chunks, total_tokens)
+    if verbose and finalize:
+        print_stats(input_chars, output_chars, total_elapsed, total_chunks, total_tokens)
+
+    # Sesja końcowa — stan "finished"
+    meta.update({
+        "state": "finished",
+        "next_chunk": total_chunks + 1,
+        "failed_chunks": failed_chunks,
+        "failures": {str(k): v for k, v in failure_log.items()},
+    })
+    (chunks_dir / "session.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    _release_session_lock(lock)
+
+    emit({
+        "type": "finished",
+        "output_path": output_path,
+        "input_chars": input_chars,
+        "output_chars": output_chars,
+        "elapsed": total_elapsed,
+        "total_tokens": total_tokens,
+        "failed_chunks": failed_chunks,
+        "failures": {str(k): v for k, v in failure_log.items()},
+        "finalized": finalize,
+    })
     return output_path
+
+# ── Resume pipeline ───────────────────────────────────────────────────────────
+def find_resumable_sessions(input_path: str, output_dir: str = "output") -> list[dict]:
+    """Sesje (katalogi run w output/) dla tego pliku, które nie zostały skończone.
+
+    Zwraca listę posortowaną od najnowszej: {run_dir, output_path, next_chunk,
+    total_chunks, stopped_at, state}.
+    """
+    target = str(Path(input_path).resolve())
+    base = Path(output_dir)
+    if not base.is_dir():
+        return []
+
+    sessions = []
+    for run in base.iterdir():
+        sf = run / "chunks" / "session.json"
+        if not sf.exists():
+            continue
+        try:
+            meta = json.loads(sf.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if meta.get("input_path") != target or meta.get("state") == "finished":
+            continue
+        try:
+            stopped_at = datetime.fromtimestamp(sf.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        except OSError:
+            stopped_at = "?"
+        sessions.append({
+            "run_dir": str(run.resolve()),
+            "output_path": meta.get("output_path", str((run / run.name).resolve())),
+            "next_chunk": int(meta.get("next_chunk", 1) or 1),
+            "total_chunks": int(meta.get("total_chunks", 0) or 0),
+            "stopped_at": stopped_at,
+            "state": meta.get("state", "?"),
+        })
+    sessions.sort(key=lambda s: s["stopped_at"], reverse=True)
+    return sessions[:10]
+
+
+def resume_translation(output_path: str, cfg: dict, verbose: bool = True,
+                       on_event=None, finalize: bool = False,
+                       stop_event=None, max_time: float = None) -> str | None:
+    """Wznawia przerwaną sesję: generuje TYLKO brakujące chunki.
+
+    output_path — plik wyjściowy lub katalog sesji (run dir).
+    Gotowe chunki ( nawet z markerem błędu ) pozostają nietknięte; błędy
+    naprawia się dotychczasowym przepływem: retry / errors.md.
+    finalize=False (GUI): bez sklejania — plik wyjściowy powstaje ręcznie.
+    """
+    def emit(ev: dict):
+        if on_event:
+            try:
+                on_event(ev)
+            except Exception:
+                pass
+
+    meta = load_session(output_path)   # sys.exit(1), gdy brak session.json
+    chunks_dir = Path(meta["chunks_dir"])
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    orig_dir = chunks_dir / "original"
+    orig_dir.mkdir(parents=True, exist_ok=True)
+    total_chunks = int(meta["total_chunks"])
+    chunk_size = meta["chunk_size"]
+    overlap = meta["overlap"]
+    input_path = str(meta["input_path"])
+    real_output = str(meta["output_path"])
+
+    lock = _acquire_session_lock(chunks_dir)
+
+    if verbose:
+        print(f"  {c(C.CYAN, '📖 Sesja:')}     {c(C.WHITE, chunks_dir.parent.name)}")
+
+    input_path_obj = Path(input_path)
+    if not input_path_obj.exists():
+        print(c(C.RED, f"✗ Plik źródłowy tej sesji nie istnieje: {input_path}"))
+        _release_session_lock(lock)
+        sys.exit(1)
+
+    backend_name = cfg.get("backend", "ollama")
+    model_name = {
+        "ollama":       cfg.get("ollama_model"),
+        "deepseek":     cfg.get("deepseek_model"),
+        "opencode-go":  cfg.get("opencode_go_model"),
+    }.get(backend_name)
+    backend = get_backend(cfg)
+
+    if verbose:
+        print(f"  {c(C.DIM, 'Sprawdzam połączenie...')}", end=" ", flush=True)
+    if not backend.check_connection():
+        if verbose:
+            print(c(C.RED, "✗ BŁĄD"))
+        _release_session_lock(lock)
+        sys.exit(1)
+    if verbose:
+        print(c(C.GREEN, "✓ OK"))
+
+    text = input_path_obj.read_text(encoding="utf-8")
+    got_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if meta.get("input_sha256") and got_sha != meta["input_sha256"]:
+        _release_session_lock(lock)
+        print(c(C.RED, "✗ Plik źródłowy zmienił się od czasu sesji — chunki mogłyby "
+                       "przestać pokrywać się z zapisanymi. Uruchom świeże tłumaczenie."))
+        sys.exit(1)
+
+    chunks = split_into_chunks(text, chunk_size, overlap)
+    if len(chunks) != total_chunks:
+        _release_session_lock(lock)
+        print(c(C.RED, f"✗ Niezgodność planu chunków: {len(chunks)} ≠ {total_chunks} — "
+                       "plik źródłowy zmieniony od czasu sesji."))
+        sys.exit(1)
+
+    system_prompt = cfg["system_prompt"].strip()
+
+    # ── wczytaj gotowe chunki (nawet z markerem błędu — błędy robić przez retry) ─
+    loaded: dict[int, str] = {}
+    for i in range(1, total_chunks + 1):
+        cf = chunks_dir / f"chunk_{i:03d}.txt"
+        if cf.exists():
+            loaded[i] = cf.read_text(encoding="utf-8")
+
+    start_time = time.time()
+    deadline = start_time + max_time if max_time else None
+    stop_reason = None
+    failure_log: dict[int, dict] = {
+        int(k): v for k, v in (meta.get("failures") or {}).items()
+        if str(k).isdigit()
+    }
+
+    emit({
+        "type": "start",
+        "input_path": input_path,
+        "output_path": real_output,
+        "backend": backend_name,
+        "model": model_name,
+        "total_chunks": total_chunks,
+        "chunks_en": chunks,
+        "chunk_size": chunk_size,
+        "resumed": True,
+        "chunks_pl": [loaded.get(i, "") for i in range(1, total_chunks + 1)],
+    })
+
+    if verbose:
+        have = len(loaded)
+        missing = total_chunks - have
+        print(f"  {c(C.CYAN, '⏭ Gotowych chunków:')} {c(C.GREEN, f'{have}/{total_chunks}')}"
+              f"{c(C.DIM, f'  (do wygenerowania: {missing})')}")
+
+    prev_translation = ""
+    total_tokens = 0
+    translated_chunks = []
+
+    try:
+        for i in range(1, total_chunks + 1):
+            if stop_event is not None and stop_event.is_set():
+                stop_reason = "user"
+                break
+            if deadline is not None and time.time() >= deadline:
+                stop_reason = "time"
+                break
+
+            if i in loaded:
+                prev_translation = loaded[i]      # kontekst jak przy ciągłym tłumaczeniu
+                translated_chunks.append(loaded[i])
+                continue
+
+            emit({"type": "chunk_start", "idx": i, "total": total_chunks})
+
+            elapsed = time.time() - start_time
+            done_now = i - len([k for k in loaded if k <= i])
+            eta = (elapsed / max(done_now, 0.001)) * (total_chunks - i) if done_now > 0 else 0
+
+            r = _translate_one_chunk(
+                backend, system_prompt, cfg, chunks[i - 1], i, total_chunks,
+                prev_translation, chunks_dir, orig_dir, verbose, emit, eta=eta)
+
+            loaded[i] = r["pl"]
+            translated_chunks.append(r["pl"])
+            prev_translation = r["pl"]
+            total_tokens += r["tokens"]
+            if not r["ok"]:
+                failure_log[i] = {"reason": r["reason"], "details": r["details"]}
+
+            meta.update({
+                "state": "running",
+                "next_chunk": i + 1,
+                "failed_chunks": detect_error_chunks(real_output),
+                "failures": {str(k): v for k, v in failure_log.items()},
+            })
+            (chunks_dir / "session.json").write_text(
+                json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    except GenerationStopped:
+        stop_reason = "user"
+        emit({"type": "chunk_aborted", "idx": len(translated_chunks) + 1})
+    except KeyboardInterrupt:
+        stop_reason = "keyboard"
+        emit({"type": "chunk_aborted", "idx": len(translated_chunks) + 1})
+
+    total_elapsed = time.time() - start_time
+    done_all = len(loaded) == total_chunks
+
+    if stop_reason or not done_all:
+        why = stop_reason or "user"
+        meta.update({
+            "state": "stopped",
+            "failed_chunks": detect_error_chunks(real_output),
+            "failures": {str(k): v for k, v in failure_log.items()},
+        })
+        (chunks_dir / "session.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        _release_session_lock(lock)
+        if verbose:
+            print(c(C.YELLOW, f"  {_stopped_session_message(why)}"))
+            print(c(C.DIM, f"  Wznowienie: uv run translator resume {real_output}"))
+        emit({
+            "type": "stopped",
+            "next_chunk": len(translated_chunks) + 1,
+            "stop_reason": why,
+            "elapsed": total_elapsed,
+        })
+        return real_output
+
+    meta.update({
+        "state": "finished",
+        "next_chunk": total_chunks + 1,
+        "failed_chunks": detect_error_chunks(real_output),
+        "failures": {str(k): v for k, v in failure_log.items()},
+    })
+    (chunks_dir / "session.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    _release_session_lock(lock)
+
+    if finalize:
+        stitch_session(real_output, new_failures=failure_log, verbose=verbose)
+
+    if verbose and not finalize:
+        print(f"  {c(C.GREEN, '✓ Wszystkie chunki gotowe')} — {c(C.DIM, 'scal ręcznie / GUI')}")
+
+    emit({
+        "type": "finished",
+        "output_path": real_output,
+        "input_chars": len(text),
+        "output_chars": sum(len(Path(chunks_dir / f'chunk_{i:03d}.txt').read_text(encoding='utf-8'))
+                            for i in range(1, total_chunks + 1)
+                            if (chunks_dir / f"chunk_{i:03d}.txt").exists()),
+        "elapsed": total_elapsed,
+        "total_tokens": total_tokens,
+        "failed_chunks": detect_error_chunks(real_output),
+        "failures": {str(k): v for k, v in failure_log.items()},
+        "finalized": finalize,
+    })
+    return real_output
+
 
 # ── Refine pipeline ───────────────────────────────────────────────────────────
 def refine_file(draft_path: str, original_path: str = None, cfg: dict = None, output_path: str = None, verbose: bool = True) -> str:
@@ -1412,6 +1986,20 @@ def print_run_config(cfg: dict, input_path: str = None, output_path: str = None,
 # ── CLI handlers ──────────────────────────────────────────────────────────────
 def cmd_translate(args):
     cfg = load_config(args.config)
+
+    # --prompt: edytor prompt.yaml przed tłumaczeniem (zapis = update dla tego
+    # i kolejnych tłumaczeń)
+    if getattr(args, "prompt", False):
+        try:
+            from gui import run_prompt_editor
+        except ImportError as e:
+            print(c(C.RED, f"✗ Edytor prompta niedostępny ({e}). Zainstaluj zależności: uv sync"))
+            return
+        if not run_prompt_editor(args.config):
+            print(c(C.DIM, "Anulowano — prompt.yaml bez zmian."))
+            return
+        cfg = load_config(args.config)
+
     if sys.stdin.isatty() and not args.quiet and not args.model and not args.backend:
         interactive_backend_model(cfg)
     if args.backend: cfg["backend"] = args.backend
@@ -1424,9 +2012,23 @@ def cmd_translate(args):
     if args.temperature is not None: cfg["temperature"] = args.temperature
     print_run_config(cfg, args.input, args.output, args.dry_run, refine=args.refine)
 
-    out = translate_file(args.input, cfg, args.output, args.dry_run, not args.quiet)
+    # --gui: okno z podglądem tłumaczenia (EN | PL, chunk po chunku)
+    if getattr(args, "gui", False):
+        if args.dry_run:
+            print(c(C.YELLOW, "⚠ --dry-run nie otwiera GUI — plan chunków pokażę w konsoli."))
+        else:
+            try:
+                from gui import run_gui
+            except ImportError as e:
+                print(c(C.RED, f"✗ GUI niedostępne ({e}). Zainstaluj zależności: uv sync"))
+                return
+            run_gui(args, cfg)
+            return
 
-    if args.refine and out:
+    out = translate_file(args.input, cfg, args.output, args.dry_run, not args.quiet,
+                         max_time=getattr(args, "max_time", None))
+
+    if args.refine and out and Path(out).exists():
         refine_file(out, args.input, cfg, verbose=not args.quiet)
 
 def cmd_refine(args):
@@ -1457,6 +2059,20 @@ def cmd_info(args):
     }.get(backend)
     print(f"Backend: {backend}")
     print(c(C.WHITE, f"  Model: {c(C.GREEN, model or '?')}"))
+
+def cmd_resume(args):
+    cfg = load_config(args.config)
+    if sys.stdin.isatty() and not args.model and not args.backend:
+        interactive_backend_model(cfg)
+    if args.backend: cfg["backend"] = args.backend
+    if args.model:
+        cfg["ollama_model"] = args.model
+        cfg["deepseek_model"] = args.model
+        cfg["opencode_go_model"] = args.model
+    if getattr(args, "reasoning", None): cfg["reasoning_effort"] = args.reasoning
+    print_run_config(cfg, output_path=None, refine=False)
+    resume_translation(args.output, cfg, verbose=not args.quiet,
+                       finalize=True, max_time=getattr(args, "max_time", None))
 
 def cmd_retry(args):
     cfg = load_config(args.config)
@@ -1499,6 +2115,12 @@ def main():
     p_t.add_argument("--temperature", type=float, default=None)
     p_t.add_argument("--dry-run", action="store_true")
     p_t.add_argument("--refine", action="store_true")
+    p_t.add_argument("--max-time", type=int, default=None,
+                     help="zatrzymaj tłumaczenie po N sekundach (wznowienie: ... resume <plik>)")
+    p_t.add_argument("--gui", action="store_true",
+                     help="podgląd tłumaczenia w oknie (EN | PL, chunk po chunku)")
+    p_t.add_argument("--prompt", action="store_true",
+                     help="edytuj prompt.yaml przed tłumaczeniem (zapis = update na stałe)")
     p_t.add_argument("-q", "--quiet", action="store_true")
     p_t.set_defaults(func=cmd_translate)
 
@@ -1526,6 +2148,19 @@ def main():
     p_retry.add_argument("--backend", "-b", choices=["ollama", "deepseek", "opencode-go"], default=None)
     p_retry.add_argument("--reasoning", "-r", choices=["low", "medium", "high", "max"], default=None)
     p_retry.set_defaults(func=cmd_retry)
+
+    # Nowa komenda RESUME — wznowienie przerwanej sesji (stop / restart komputera)
+    p_res = sub.add_parser("resume", aliases=["res"],
+                           help="wznów przerwaną sesję tłumaczenia (stop, limit czasu, restart komputera)")
+    p_res.add_argument("output",
+                       help="plik wyjściowy sesji (output/<run>/<run>.txt) lub cały katalog sesji")
+    p_res.add_argument("--max-time", type=int, default=None,
+                       help="po N sekundach znów zatrzymaj (kolejne wznowienie to samo polecenie)")
+    p_res.add_argument("--model", "-m", default=None)
+    p_res.add_argument("--backend", "-b", choices=["ollama", "deepseek", "opencode-go"], default=None)
+    p_res.add_argument("--reasoning", "-r", choices=["low", "medium", "high", "max"], default=None)
+    p_res.add_argument("-q", "--quiet", action="store_true")
+    p_res.set_defaults(func=cmd_resume)
 
     args = parser.parse_args()
     if not args.command:

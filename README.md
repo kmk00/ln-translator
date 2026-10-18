@@ -46,6 +46,21 @@ uv run translator translate <plik_wejściowy> --dry-run
 uv run translator translate <plik_wejściowy> --chunk-size 3000 --temperature 0.2
 
 # ────────────────────────────────────────────────────────
+# GUI — podgląd tłumaczenia na żywo (EN | PL)
+# ────────────────────────────────────────────────────────
+
+# Parametry ustawiasz w konsoli, okno pokazuje postęp chunk po chunku
+uv run translator translate <plik_wejściowy> --gui
+
+# Z pełnym zestawem parametrów
+uv run translator translate <plik_wejściowy> --gui --backend opencode-go --model glm-5.3-flash
+
+# Przed startem otwórz edytor prompt.yaml (zapis = update na stałe,
+# użyty w tym i wszystkich kolejnych tłumaczeniach; działa też bez --gui)
+uv run translator translate <plik_wejściowy> --prompt
+uv run translator translate <plik_wejściowy> --gui --prompt
+
+# ────────────────────────────────────────────────────────
 # DIAGNOSTYKA, KOREKTA I NAPRAWA BŁĘDÓW
 # ────────────────────────────────────────────────────────
 
@@ -65,6 +80,21 @@ uv run translator retry output/<plik_wyjściowy>
 uv run translator retry output/<plik_wyjściowy> --chunks 6 8
 
 # ────────────────────────────────────────────────────────
+# STOP I WZNAWIANIE (limit czasu / restart komputera)
+# ────────────────────────────────────────────────────────
+
+# Auto-stop po N sekundach (limit czasu na właśnie ten przebieg)
+uv run translator translate <plik_wejściowy> --max-time 7200
+
+# Ctrl+C w trakcie też zapisuje sesję (state="stopped") zamiast nic nie zostawiać
+
+# Wznowienie przerwanej sesji (generuje TYLKO brakujące chunki)
+uv run translator resume output/<run>/<run>.txt
+
+# Po katalogu sesji też działa; z kolejnym limitem czasu
+uv run translator resume output/<run> --max-time 3600
+
+# ────────────────────────────────────────────────────────
 # GO Scripts
 # ────────────────────────────────────────────────────────
 
@@ -75,6 +105,102 @@ go run main.go sample.pdf output.txt
 go run main.go --split sample.pdf output.txt  # split by chapters
 
 ```
+
+## GUI — podgląd tłumaczenia na żywo
+
+Flaga `--gui` otwiera okno z podglądem tłumaczenia w trakcie pracy silnika.
+Parametry (backend, model, temperatura, chunk size) ustawiasz jak dotychczas
+w konsoli — okno tylko pokazuje wynik:
+
+```bash
+uv run translator translate "Fate Strange Fake - Vol.8-plain.txt" --gui --backend opencode-go
+```
+
+### Co pokazuje okno
+
+- **Widok side-by-side** — lewa kolumna to oryginał EN, prawa tłumaczenie PL,
+  ze zsynchronizowanym scrollem i numeracją linii (pipelina wymusza 1:1 linii,
+  więc pary linii są na tej samej wysokości).
+- **Pasek chunków** — każdy chunk to przycisk z kolorem statusu: szary
+  (oczekuje), niebieski pulsujący (generowanie), zielony (gotowy), czerwony
+  (błąd). Klik = skok do chunka.
+- **Wynik po zakończeniu chunka** — treść pojawia się w całości dopiero po
+  ukończeniu generowania (nie streamuje w trakcie), z krótkim rozbłyskiem
+  podświetlenia.
+- **Panel statystyk** — postęp, ukończone/błędy, linie EN/PL, znaki, tokeny,
+  prędkość, średni czas chunka, ETA, plik wyjściowy.
+- **Panel błędów** — nieudane chunki z powodem + przycisk *ponów* (per chunk
+  lub wszystkie naraz); naprawiony chunk od razu odświeża widok.
+
+### Nawigacja
+
+| Klawisz | Akcja |
+|---|---|
+| `←` / `→` | poprzedni / następny chunk |
+| `PgUp` / `PgDn` | skok o 10 chunków |
+| `Home` / `End` | pierwszy / ostatni chunk |
+| `Ctrl+S` | zapis oczekujących poprawek bieżącego chunka |
+
+Checkbox **„podążaj za postępem"** (domyślnie włączony) przewiduje widok do
+chunka, który właśnie się skończył — ręczny skok go wyłącza.
+
+### Ręczna korekta chunków i scalanie
+
+Panel PL jest **edytowalny dla ukończonych chunków** — możesz poprawiać
+tłumaczenie na żywo, podczas gdy kolejne chunki się generują (fokus na panel
+wyłącza auto-podążanie, żeby nic nie skoczyło pod kursor).
+
+- **Autozapis** — poprawki zapisują się ~0,8 s po skończeniu pisania, przy
+  zmianie chunka, przez `Ctrl+S` i przed scaleniem; do skutku zapisu info-chunk
+  pokazuje „• niezapisane".
+- **Walidacja 1:1** — po zapisie GUI sprawdza liczbę linii: zgodna → chunk
+  dostaje bursztynowy status „edytowany"; rozjazd → chunk wraca na czerwono
+  z powodem „edycja: EN x ≠ PL y". Poprawka błędnego chunka czyści jego błąd.
+- **Odroczone scalanie** — GUI nie skleja pliku automatycznie. Po ostatnim
+  chunku okno pyta „Scalić teraz?", a w sidebarze czeka przycisk
+  **„Scal do pliku"** (po scaleniu: „Scal ponownie" — każdy kolejny klik
+  uwzględnia najnowsze poprawki).
+- **Scalanie z rozjazdami** — jeśli któryś chunk jest czerwony, okno wyświetla
+  listę i pyta „scalić mimo to?".
+- **Retry vs edycje** — ponowienie chunka edytowanego ręcznie wymaga
+  potwierdzenia (nadpisze zmiany); w trakcie retry edycja jest zablokowana.
+- **Zamykanie** — przy niescalonych chunkach okno proponuje scalenie przed
+  wyjściem, więc nie zostaniesz bez pliku wyjściowego.
+
+### Stop i wznowienie ("pauza")
+
+Silnik zapisuje każdy chunk od razu na dysk (`chunks/chunk_NNN.txt` + świeże
+`session.json`), więc tłumaczenie można przerwać w dowolnym momencie
+i wznowić później — nawet po zamknięciu programu lub restarcie komputera:
+
+- **⏹ Zatrzymaj** (sidebar, sekcja STEROWANIE) — natychmiast przerywa
+  generowanie bieżącego chunka (abort streamu). Przerwany chunk nie zostaje
+  zapisany; wznowienie wygeneruje go od zera.
+- **Auto-stop po X min** — spinbox w sekcji STEROWANIE; limit sprawdza między
+  chunkami (ustawiane przed startem / wznowieniem).
+- **Zamknięcie okna** w trakcie tłumaczenia robi łagodny stop — zamiast
+  ubijać wątek na twardo, ustawia stop i czeka do 8 s na zapis sesji.
+- **Wznowienie po restarcie komputera** — przy uruchomieniu:
+  `uv run translator translate <plik> --gui` wykryje niedokończoną sesję
+  tego pliku i się zapyta, czy wznowić od miejsca przerwania. W otwartym
+  oknie zatrzymanej sesji służy przycisk **„Wznów”** (aktywny po zatrzymaniu
+  albo błędzie wątku roboczego).
+- **Chunki już gotowe (nawet z błędem)** nie przepisują się przy wznowieniu;
+  błędy traktuj dotychczasowo: `retry`, raport `errors.md` lub ręczna poprawka
+  w edytorze GUI.
+- **Plik wejściowy zmieniony od czasu sesji?** Wznowienie tego pilnuje
+  (sha256 oryginału w sesji) i nie pozwoli sklejać rozjechanych chunków.
+
+### Flaga --prompt (edytor prompt.yaml)
+
+`--prompt` przed startem otwiera okno edytora z pełną treścią `prompt.yaml`:
+
+- **Zapisz i kontynuuj** — waliduje YAML i zapisuje plik; zmiany obowiązują
+  w tym tłumaczeniu i wszystkich kolejnych,
+- **Anuluj** — kończy bez zmian,
+- zapis z błędnym YAML-em zostanie odrzucony z komunikatem.
+
+Flaga działa też bez `--gui` (samo okno edytora, dalej tłumaczenie w konsoli).
 
 ## Format 1:1 (linijka po linijce)
 
@@ -138,7 +264,8 @@ export OLLAMA_MODEL="gemma4:26b"
 
 ```
 ln-translator/
-├── translator.py      # główny skrypt
+├── translator.py      # główny skrypt (CLI + silnik tłumaczenia)
+├── gui.py             # okno podglądu tłumaczenia (PySide6) + edytor prompt.yaml
 ├── prompt.yaml        # konfiguracja promptu i ustawień
 ├── pyproject.toml     # definicja projektu (uv)
 ├── README.md
